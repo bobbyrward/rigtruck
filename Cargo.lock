@@ -496,22 +496,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitlab-pipeline-monitor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "dirs",
- "futures-util",
- "git2",
- "gitlab",
- "indicatif",
- "regex",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "graphql-parser"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1245,6 +1229,22 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "winreg",
+]
+
+[[package]]
+name = "rigtruck"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
+ "futures-util",
+ "git2",
+ "gitlab",
+ "indicatif",
+ "regex",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
