@@ -237,6 +237,9 @@ async fn main() -> Result<()> {
                     .await
                     .context("Failed getting pipeline")?;
 
+                // Give gitlab a chance to update the status of the pipeline
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
                 println!("\nStatus: {:?}", pipeline.status);
             }
             _ => println!("\nStatus: {:?}", last_pipeline.status),
