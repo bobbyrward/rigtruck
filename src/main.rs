@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
 
     if let Some(ref last_pipeline) = commit.last_pipeline {
         println!(
-            "'{}'\n\nPipeline {}: {}\nURL: {}\n",
+            "{}\n\nPipeline {}: {}\nURL: {}\n",
             project.name_with_namespace,
             last_pipeline.id.value(),
             commit.title,
@@ -191,6 +191,7 @@ async fn main() -> Result<()> {
                             stage_multi_pb.add(ProgressBar::new(stage_jobs.len() as u64));
                         stage_pb.set_style(
                             ProgressStyle::default_bar()
+                                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
                                 .template(&format!("[{}]: {{spinner}}{{msg}}", stage)),
                         );
 
