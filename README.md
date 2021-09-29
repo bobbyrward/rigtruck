@@ -1,3 +1,3 @@
-# gitlab-pipeline-monitor
+# rigtruck
 
-The quick and dirty gitlab pipeline monitor that's likely broken.
+Tail the status of a gitlab pipeline

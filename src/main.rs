@@ -1,13 +1,16 @@
+mod gitlab_api;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use clap::Clap;
-use gitlab::api::{projects, AsyncQuery};
-use gitlab::types::{Job, Pipeline, Project, RepoCommitDetail, StatusState};
-use gitlab::{AsyncGitlab, GitlabBuilder};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+use crate::gitlab_api::{GitlabAPI, Job, StatusState};
+
+const JOB_SPINNER_TEMPLATE: &'static str = "  * [{msg}]: {spinner}";
 
 const STAGES: &'static [&'static str] = &[
     "prebuild",
@@ -20,12 +23,62 @@ const STAGES: &'static [&'static str] = &[
 ];
 
 #[derive(Debug, Clone, Clap)]
+#[clap(version=clap::crate_version!())]
 struct Args {
     #[clap(long)]
+    /// Gitlab personal access token.  If not provided, it will attempt to parse ~/.netrc.
     pat: Option<String>,
 
     #[clap(long, default_value = ".")]
+    /// The path to the git repository to use for metadata
     path: String,
+
+    #[clap(long, short)]
+    failure_logs: bool,
+
+    #[clap(long)]
+    /// Disable notications on completion
+    no_notification: bool,
+}
+
+impl Args {
+    async fn get_pat(&self) -> Result<String> {
+        if let Some(pat) = &self.pat {
+            Ok(pat.clone())
+        } else {
+            parse_netrc().await
+        }
+    }
+}
+
+fn is_terminal_state(state: StatusState) -> bool {
+    matches!(
+        state,
+        StatusState::Success | StatusState::Failed | StatusState::Canceled
+    )
+}
+
+fn is_running_state(state: StatusState) -> bool {
+    matches!(
+        state,
+        StatusState::Created | StatusState::Pending | StatusState::Running
+    )
+}
+
+fn is_tailable_state(state: StatusState) -> bool {
+    is_terminal_state(state) || is_running_state(state)
+}
+
+fn create_spinner(template: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(spinner_style(template));
+    pb
+}
+
+fn spinner_style(template: &str) -> ProgressStyle {
+    ProgressStyle::default_spinner()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+        .template(template)
 }
 
 async fn parse_netrc() -> Result<String> {
@@ -50,20 +103,13 @@ async fn parse_netrc() -> Result<String> {
 }
 
 async fn poll_job(
-    gl: Arc<AsyncGitlab>,
+    api: Arc<GitlabAPI>,
     project_id: u64,
     job_id: u64,
     progress: ProgressBar,
-) -> Result<()> {
+) -> Result<(u64, String, StatusState)> {
     loop {
-        let job: Job = projects::jobs::Job::builder()
-            .project(project_id)
-            .job(job_id)
-            .build()
-            .map_err(|e| anyhow!("Gitlab error: {}", e))?
-            .query_async(gl.as_ref())
-            .await
-            .context("Failed getting job")?;
+        let job = api.get_job(project_id, job_id).await?;
 
         match job.status {
             StatusState::Pending | StatusState::Created | StatusState::Running => {
@@ -71,33 +117,24 @@ async fn poll_job(
             }
             StatusState::Success => {
                 progress.finish_and_clear();
-                break;
+                return Ok((job_id, job.name, job.status));
             }
             _ => {
                 progress.finish_with_message(format!("{:?}", job.status));
-                break;
+                return Ok((job_id, job.name, job.status));
             }
         }
 
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
-
-    Ok(())
 }
 
 async fn poll_jobs(
-    gl: Arc<AsyncGitlab>,
-    project: u64,
-    pipeline: u64,
+    api: Arc<GitlabAPI>,
+    project_id: u64,
+    pipeline_id: u64,
 ) -> Result<HashMap<String, Vec<Job>>> {
-    let jobs: Vec<Job> = projects::pipelines::PipelineJobs::builder()
-        .project(project)
-        .pipeline(pipeline)
-        .build()
-        .map_err(|e| anyhow!("Gitlab error: {}", e))?
-        .query_async(gl.as_ref())
-        .await
-        .context("PipelineJobs failed")?;
+    let jobs = api.get_pipeline_jobs(project_id, pipeline_id).await?;
 
     let mut result: HashMap<String, Vec<Job>> = HashMap::new();
 
@@ -108,7 +145,7 @@ async fn poll_jobs(
     Ok(result)
 }
 
-async fn get_repo(path: &str) -> Result<git2::Repository> {
+fn get_repo(path: &str) -> Result<git2::Repository> {
     Ok(git2::Repository::discover(path)?)
 }
 
@@ -125,129 +162,139 @@ fn get_project_path(origin_url: &str) -> Result<&str> {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct StageResults {
+    succeeded: Vec<(u64, String)>,
+    failed: Vec<(u64, String)>,
+}
+
+async fn monitor_stage(
+    api: Arc<GitlabAPI>,
+    project_id: u64,
+    pipeline_id: u64,
+    stage: &str,
+) -> Result<StageResults> {
+    let jobs = poll_jobs(api.clone(), project_id, pipeline_id).await?;
+
+    if let Some(stage_jobs) = jobs.get::<str>(stage) {
+        let stage_multi_pb = Arc::new(MultiProgress::new());
+        let stage_pb =
+            stage_multi_pb.add(create_spinner(&format!("[{}]: {{spinner}}{{msg}}", stage)));
+
+        let handle_multi = tokio::task::spawn_blocking({
+            let bg_stage_multi_pb = stage_multi_pb.clone();
+
+            move || bg_stage_multi_pb.join().unwrap()
+        });
+
+        // This needs to go after starting the multi in the background
+        stage_pb.enable_steady_tick(300);
+
+        let stage_job_handles = stage_jobs
+            .iter()
+            .map(|job| {
+                let spinner = stage_multi_pb.add(create_spinner(JOB_SPINNER_TEMPLATE));
+                spinner.set_message(job.name.clone());
+                spinner.enable_steady_tick(300);
+
+                tokio::spawn(poll_job(api.clone(), project_id, job.id.value(), spinner))
+            })
+            .collect::<Vec<_>>();
+
+        let results = futures_util::future::try_join_all(stage_job_handles)
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut succeeded = vec![];
+        let mut failed = vec![];
+
+        for (job_id, job_name, state) in results {
+            match state {
+                StatusState::Failed => failed.push((job_id, job_name)),
+                _ => succeeded.push((job_id, job_name)),
+            };
+        }
+
+        stage_pb.finish_with_message(format!("Success"));
+        let _ = handle_multi.await;
+
+        return Ok(StageResults { succeeded, failed });
+    }
+
+    Ok(StageResults::default())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let api = Arc::new(GitlabAPI::new(&args.get_pat().await?).await?);
 
-    let pat = if let Some(pat) = args.pat {
-        pat
-    } else {
-        parse_netrc().await?
-    };
-
-    let gl = Arc::new(GitlabBuilder::new("gitlab.com", pat).build_async().await?);
-
-    let repo = get_repo(&args.path).await?;
+    let repo = get_repo(&args.path)?;
     let head = repo.head()?.peel_to_commit()?;
     let remote = repo.find_remote("origin")?;
     let remote_url = remote.url().ok_or_else(|| anyhow!("Missing origin url"))?;
 
-    let project_path = get_project_path(remote_url)?;
+    let project = api.get_project(get_project_path(remote_url)?).await?;
+    let commit = api
+        .get_commit(project.id.value(), &head.id().to_string())
+        .await?;
 
-    let project: Project = projects::Project::builder()
-        .project(project_path)
-        .build()
-        .map_err(|e| anyhow!("Gitlab error: {}", e))?
-        .query_async(gl.as_ref())
-        .await
-        .context("Failed getting project")?;
+    let last_pipeline = commit
+        .last_pipeline
+        .ok_or_else(|| anyhow!("Commit {} has no associated pipelines", head.id()))?;
 
-    let commit: RepoCommitDetail = projects::repository::commits::Commit::builder()
-        .project(project.id.value())
-        .commit(head.id().to_string())
-        .build()
-        .map_err(|e| anyhow!("Gitlab error: {}", e))?
-        .query_async(gl.as_ref())
-        .await
-        .context("Failed getting commit")?;
+    println!(
+        "{}\n\nPipeline {}: {}\nURL: {}\n",
+        project.name_with_namespace,
+        last_pipeline.id.value(),
+        commit.title,
+        last_pipeline.web_url,
+    );
 
-    if let Some(ref last_pipeline) = commit.last_pipeline {
-        println!(
-            "{}\n\nPipeline {}: {}\nURL: {}\n",
-            project.name_with_namespace,
-            last_pipeline.id.value(),
-            commit.title,
-            last_pipeline.web_url,
-        );
+    if is_tailable_state(last_pipeline.status) {
+        let initial_status = last_pipeline.status;
 
-        let spinner_style = ProgressStyle::default_spinner()
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-            .template("  * [{msg}]: {spinner}");
+        let mut failed_jobs = vec![];
 
-        match last_pipeline.status {
-            StatusState::Created
-            | StatusState::Pending
-            | StatusState::Running
-            | StatusState::Success
-            | StatusState::Failed
-            | StatusState::Canceled => {
-                for stage in STAGES {
-                    let jobs =
-                        poll_jobs(gl.clone(), project.id.value(), last_pipeline.id.value()).await?;
+        for stage in STAGES {
+            let mut stage_results = monitor_stage(
+                api.clone(),
+                project.id.value(),
+                last_pipeline.id.value(),
+                stage,
+            )
+            .await?;
 
-                    if let Some(stage_jobs) = jobs.get::<str>(stage) {
-                        let stage_multi_pb = MultiProgress::new();
-                        let stage_pb =
-                            stage_multi_pb.add(ProgressBar::new(stage_jobs.len() as u64));
-                        stage_pb.set_style(
-                            ProgressStyle::default_bar()
-                                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-                                .template(&format!("[{}]: {{spinner}}{{msg}}", stage)),
-                        );
-
-                        stage_pb.enable_steady_tick(300);
-
-                        let stage_job_handles = stage_jobs
-                            .iter()
-                            .map(|job| {
-                                let spinner = stage_multi_pb.add(ProgressBar::new_spinner());
-                                spinner.set_style(spinner_style.clone());
-                                // spinner.set_prefix(format!("
-                                spinner.enable_steady_tick(300);
-                                spinner.set_message(job.name.clone());
-
-                                tokio::spawn(poll_job(
-                                    gl.clone(),
-                                    project.id.value(),
-                                    job.id.value(),
-                                    spinner,
-                                ))
-                            })
-                            .collect::<Vec<_>>();
-
-                        let handle_multi =
-                            tokio::task::spawn_blocking(move || stage_multi_pb.join().unwrap()); // add this line
-
-                        let result = futures_util::future::try_join_all(stage_job_handles).await;
-                        result?;
-
-                        stage_pb.finish_with_message(format!("Success"));
-                        let _ = handle_multi.await;
-                    } else {
-                        continue;
-                    }
-                }
-
-                let pipeline: Pipeline = projects::pipelines::Pipeline::builder()
-                    .project(project.id.value())
-                    .pipeline(last_pipeline.id.value())
-                    .build()
-                    .map_err(|e| anyhow!("Gitlab error: {}", e))?
-                    .query_async(gl.as_ref())
-                    .await
-                    .context("Failed getting pipeline")?;
-
-                // Give gitlab a chance to update the status of the pipeline
-                tokio::time::sleep(Duration::from_millis(500)).await;
-
-                println!("\nStatus: {:?}", pipeline.status);
+            if !stage_results.failed.is_empty() {
+                failed_jobs.append(&mut stage_results.failed);
             }
-            _ => println!("\nStatus: {:?}", last_pipeline.status),
-        };
+        }
 
-        // Do stuff with last_pipeline
+        // Give gitlab a chance to update the status of the pipeline
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let pipeline = api
+            .get_pipeline(project.id.value(), last_pipeline.id.value())
+            .await?;
+
+        println!("\nStatus: {:?}", pipeline.status);
+
+        if !args.no_notification && !is_terminal_state(initial_status) {
+            // do notication
+        }
+
+        if args.failure_logs && !failed_jobs.is_empty() {
+            for (job_id, job_name) in failed_jobs {
+                println!(
+                    "{}:\n{}\n\n",
+                    job_name,
+                    api.get_job_trace(project.id.value(), job_id).await?
+                );
+            }
+        }
     } else {
-        return Err(anyhow!("Commit {} has no associated pipelines", head.id()));
+        println!("\nStatus: {:?}", last_pipeline.status);
     }
 
     Ok(())

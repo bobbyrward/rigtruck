@@ -193,7 +193,9 @@ dependencies = [
  "encode_unicode",
  "lazy_static",
  "libc",
+ "regex",
  "terminal_size",
+ "unicode-width",
  "winapi",
 ]
 
@@ -472,9 +474,9 @@ dependencies = [
 
 [[package]]
 name = "gitlab"
-version = "0.1401.0"
+version = "0.1403.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dac206586d7098c62341e16ab9a9c08dcfe864427c7249a8865f488beecf0aa7"
+checksum = "f3a67e69e1baa896ba9e50734bb7ac7f49cc6e7df578f7c3deadf83b43ddd69d"
 dependencies = [
  "async-trait",
  "base64",
@@ -1237,6 +1239,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "console",
  "dirs",
  "futures-util",
  "git2",
