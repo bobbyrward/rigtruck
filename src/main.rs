@@ -282,21 +282,28 @@ async fn main() -> Result<()> {
 
         if !args.no_notification && is_terminal_state(initial_status) {
             // do notication
-            notify_rust::Notification::new()
+            let mut notification = notify_rust::Notification::new();
+
+            notification
                 .summary(&format!(
                     "{} pipeline finished: {:?}",
                     project.name, pipeline.status,
                 ))
-                .body(&format!(
+                .sound_name("dialog-information")
+                .timeout(notify_rust::Timeout::Milliseconds(6000));
+
+            if !failed_jobs.is_empty() {
+                notification.body(&format!(
                     "The following jobs failed: \n* {}",
                     failed_jobs
                         .iter()
                         .map(|(_, name)| name.as_str())
                         .collect::<Vec<_>>()
                         .join("\n* ")
-                ))
-                .timeout(notify_rust::Timeout::Milliseconds(3000))
-                .show()?;
+                ));
+            }
+
+            notification.show()?;
         }
 
         if args.failure_logs && !failed_jobs.is_empty() {
