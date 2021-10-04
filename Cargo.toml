@@ -20,5 +20,6 @@ serde_json = "1"
 indicatif = "0.16"
 console = "0.14"
 
+notify-rust = "4"
 
 

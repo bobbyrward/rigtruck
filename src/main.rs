@@ -280,8 +280,23 @@ async fn main() -> Result<()> {
 
         println!("\nStatus: {:?}", pipeline.status);
 
-        if !args.no_notification && !is_terminal_state(initial_status) {
+        if !args.no_notification && is_terminal_state(initial_status) {
             // do notication
+            notify_rust::Notification::new()
+                .summary(&format!(
+                    "{} pipeline finished: {:?}",
+                    project.name, pipeline.status,
+                ))
+                .body(&format!(
+                    "The following jobs failed: \n* {}",
+                    failed_jobs
+                        .iter()
+                        .map(|(_, name)| name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n* ")
+                ))
+                .timeout(notify_rust::Timeout::Milliseconds(3000))
+                .show()?;
         }
 
         if args.failure_logs && !failed_jobs.is_empty() {
